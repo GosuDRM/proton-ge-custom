@@ -6,6 +6,7 @@ on:
   push:
     tags:
       - 'GE-Proton*-*'
+      - 'proton-tbh-*'
 
 concurrency:
   group: ${{ github.ref_name }}
