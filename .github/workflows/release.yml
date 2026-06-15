@@ -1,5 +1,6 @@
 name: Release
 
+# Personal fork: also builds and publishes proton-tbh-* tags (in addition to GE-Proton*-*).
 on:
   release:
     types: [ published ]
