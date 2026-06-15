@@ -1,6 +1,6 @@
 name: Release
 
-# Personal fork: also builds and publishes proton-tbh-* tags (in addition to GE-Proton*-*).
+# Also builds and publishes proton-tbh-* tags (in addition to GE-Proton*-*).
 on:
   release:
     types: [ published ]
@@ -12,6 +12,10 @@ on:
 concurrency:
   group: ${{ github.ref_name }}
   cancel-in-progress: true
+
+# Creating and uploading the release requires a writable token; the repo default is read-only.
+permissions:
+  contents: write
 
 jobs:
   build:
