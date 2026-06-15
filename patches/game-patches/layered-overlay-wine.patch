@@ -1,48 +1,47 @@
 Subject: [PATCH] winex11: shaped + real-alpha transparency for layered 3D-overlay windows
+ (ALPHA-mode readback throttle, tunable hysteresis, real per-pixel-alpha click-through)
 
 Borderless WS_EX_LAYERED windows that paint per-pixel-alpha overlays through a 3D client
-surface (DWM-glass style; e.g. desktop/taskbar overlay games) render transparent regions
-as opaque black under Proton, because Wine does not honour the DWM glass path.
+surface (DWM-glass style; e.g. desktop/taskbar overlay games) render transparent regions as
+opaque black under Proton. Two opt-in modes (off by default):
+ * WINE_LAYERED_OVERLAY_SHAPE=1 - XShape the window to rendered non-black pixels.
+ * WINE_LAYERED_OVERLAY_ALPHA=1 - real per-pixel alpha via a 32-bit ARGB visual + a per-pixel
+   ShapeInput region for click-through. Requires a compositor.
 
-Two opt-in modes (off by default, no effect on other games):
- * WINE_LAYERED_OVERLAY_SHAPE=1 - XShape the window to rendered non-black pixels (works
-   without a compositor; binary mask + temporal hysteresis to avoid flicker).
- * WINE_LAYERED_OVERLAY_ALPHA=1 - real per-pixel alpha: give the Vulkan client window AND
-   the top-level window a 32-bit ARGB visual + use_alpha so the X compositor blends the
-   alpha (zero flicker). A per-pixel input shape (ShapeInput) makes transparent areas
-   click-through while opaque content stays interactive, without repaint/flicker. Pairs
-   with the DXVK presenter requesting a non-opaque compositeAlpha. Requires a compositor.
-
-Based on the original TBH-specific XShape patch by Solarisfire; generalised, flicker fixed,
-extended with the real-alpha (ARGB) path and per-pixel input shaping.
-diff --git a/dlls/winex11.drv/x11drv.h b/dlls/winex11.drv/x11drv.h
-index 9436f35e1c..5975c860b6 100644
---- a/dlls/winex11.drv/x11drv.h
-+++ b/dlls/winex11.drv/x11drv.h
-@@ -367,6 +367,8 @@ struct x11drv_escape_get_drawable
- };
- 
- extern BOOL needs_offscreen_rendering( HWND hwnd );
-+extern BOOL layered_overlay_shape_enabled(void);
-+extern BOOL layered_overlay_alpha_enabled(void);
- extern void set_dc_drawable( HDC hdc, Drawable drawable, const RECT *rect, int mode );
- extern Drawable get_dc_drawable( HDC hdc, RECT *rect );
- extern HRGN get_dc_monitor_region( HWND hwnd, HDC hdc );
+Improvements over the original (thaylorz/Solarisfire) patch:
+ * ALPHA mode no longer does a full GPU->CPU XGetImage readback every present. That readback
+   only feeds the click-through input shape, so it is throttled to WINE_LAYERED_OVERLAY_INPUT_HZ
+   (default 60 Hz; 0 = every present). First frame and every resize still refresh immediately.
+ * Shape hysteresis tunable via WINE_LAYERED_OVERLAY_HYSTERESIS (default 12).
+ * ALPHA-mode click-through is derived from the real per-pixel ALPHA (32-bit ARGB), not
+   luminance, so opaque-but-dark pixels (e.g. a sprite's black outline) stay clickable instead
+   of becoming click-through holes. Falls back to luminance if the readback isn't 32-bit, with
+   a safety net so a driver that returns no readable alpha can't make the overlay uninteractive.
+ * Readback now uses MIT-SHM (XShmGetImage into a persistent shared-memory image, server
+   writes pixels directly — no per-frame socket transfer of the whole frame), with a clean
+   fallback to XGetImage when SHM is unavailable. Mirrors wine's bitblt.c shm idiom.
 diff --git a/dlls/winex11.drv/init.c b/dlls/winex11.drv/init.c
-index 479ff421a3..c70235e0f2 100644
+index 479ff42..817dc3a 100644
 --- a/dlls/winex11.drv/init.c
 +++ b/dlls/winex11.drv/init.c
-@@ -33,6 +33,9 @@
+@@ -33,6 +33,16 @@
  #include "x11drv.h"
  #include "xcomposite.h"
  #include "wine/debug.h"
 +#ifdef HAVE_LIBXSHAPE
 +#include <X11/extensions/shape.h>
++#include <time.h>
++#endif
++#ifdef HAVE_X11_EXTENSIONS_XSHM_H
++# include <X11/extensions/XShm.h>
++# ifdef HAVE_SYS_SHM_H
++#  include <sys/shm.h>
++# endif
 +#endif
  
  WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
  
-@@ -242,9 +245,40 @@ static BOOL enable_fullscreen_hack( HWND hwnd )
+@@ -242,9 +252,85 @@ static BOOL enable_fullscreen_hack( HWND hwnd )
      return FALSE;
  }
  
@@ -76,6 +75,51 @@ index 479ff421a3..c70235e0f2 100644
 +    return enabled;
 +}
 +
++#ifdef HAVE_LIBXSHAPE
++/* ALPHA-mode click-through input-shape refresh rate, in Hz. In ALPHA mode the per-present
++ * XGetImage readback feeds ONLY the input (click-through) shape — the visible transparency
++ * is handled by the ARGB visual + compositor, so the readback is pure overhead and the
++ * input shape tolerates being a few ms stale. Throttling it removes the dominant per-frame
++ * cost (a full GPU->CPU readback of the whole overlay every present). Default 60 Hz; set
++ * WINE_LAYERED_OVERLAY_INPUT_HZ=0 to recompute every present (old behaviour). First frame
++ * and every resize always refresh immediately regardless, so the overlay is interactive at
++ * once. SHAPE mode is unaffected: there the readback also gates the visible blit. */
++static unsigned int layered_overlay_input_hz(void)
++{
++    static int hz = -1;
++    if (hz == -1)
++    {
++        const char *e = getenv( "WINE_LAYERED_OVERLAY_INPUT_HZ" );
++        hz = e ? atoi( e ) : 60;
++        if (hz < 0) hz = 0;
++    }
++    return hz;
++}
++
++/* Shape hysteresis in presents: a 4x4 block stays in the shape this many presents after it
++ * was last seen lit, absorbing transient black frames caught mid-render so the shape doesn't
++ * flicker. Tunable via WINE_LAYERED_OVERLAY_HYSTERESIS (default 12; clamped 1..255). */
++static unsigned int layered_overlay_hysteresis(void)
++{
++    static int n = -1;
++    if (n == -1)
++    {
++        const char *e = getenv( "WINE_LAYERED_OVERLAY_HYSTERESIS" );
++        n = e ? atoi( e ) : 12;
++        if (n < 1) n = 1;
++        if (n > 255) n = 255;
++    }
++    return n;
++}
++
++static ULONGLONG layered_overlay_now_ms(void)
++{
++    struct timespec ts;
++    clock_gettime( CLOCK_MONOTONIC, &ts );
++    return (ULONGLONG)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
++}
++#endif
++
  BOOL needs_offscreen_rendering( HWND hwnd )
  {
      UINT style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
@@ -83,7 +127,7 @@ index 479ff421a3..c70235e0f2 100644
      struct window_surface *surface;
      struct x11drv_win_data *data;
      BOOL needs_offscreen;
-@@ -261,6 +295,10 @@ BOOL needs_offscreen_rendering( HWND hwnd )
+@@ -261,6 +347,10 @@ BOOL needs_offscreen_rendering( HWND hwnd )
          && layered_flags & LWA_COLORKEY)
          needs_offscreen = TRUE;
  
@@ -94,7 +138,7 @@ index 479ff421a3..c70235e0f2 100644
      if (!needs_offscreen && (surface = window_surface_get( hwnd )))
      {
          TRACE("hwnd %p, surface %p, surface->alpha_mask %#x.\n", hwnd, surface, surface->alpha_mask);
-@@ -320,6 +358,13 @@ struct x11drv_client_surface
+@@ -320,6 +410,21 @@ struct x11drv_client_surface
      HDC hdc_src;
      HDC hdc_dst;
      BOOL other_process;
@@ -105,19 +149,164 @@ index 479ff421a3..c70235e0f2 100644
 +
 +    XRectangle *shape_rects;
 +    unsigned int shape_rect_count;
++    ULONGLONG shape_last_ms;        /* last input-shape refresh (ALPHA-mode throttle) */
++#ifdef HAVE_LIBXXSHM
++    XImage *shm_image;              /* persistent MIT-SHM readback image (fast path) */
++    XShmSegmentInfo shm_info;
++    unsigned int shm_w, shm_h;
++    BOOL shm_unavailable;
++    unsigned int shm_retry_count;
++#endif
  };
- 
+
  static struct x11drv_client_surface *impl_from_client_surface( struct client_surface *client )
-@@ -338,6 +383,8 @@ static void x11drv_client_surface_destroy( struct client_surface *client )
+@@ -327,6 +432,133 @@ static struct x11drv_client_surface *impl_from_client_surface( struct client_sur
+     return CONTAINING_RECORD( client, struct x11drv_client_surface, client );
+ }
+
++#ifdef HAVE_LIBXXSHM
++static int layered_overlay_shm_error( Display *display, XErrorEvent *event, void *arg )
++{
++    return 1;
++}
++
++/* Allocate a shared-memory XImage so the X server writes the overlay's pixels straight into
++   shared memory instead of copying the whole frame over the socket on every read. Returns NULL
++   (leaving shmid == -1) on any failure; the caller then falls back to plain XGetImage. */
++static XImage *layered_overlay_create_shm_image( Visual *visual, int depth,
++                                                 unsigned int width, unsigned int height,
++                                                 XShmSegmentInfo *shminfo )
++{
++    XImage *image;
++
++    shminfo->shmid = -1;
++    if (!(image = XShmCreateImage( gdi_display, visual, depth, ZPixmap, NULL, shminfo, width, height )))
++        return NULL;
++    if (image->bytes_per_line & 3) { XDestroyImage( image ); return NULL; }  /* need 32-bit alignment */
++
++    shminfo->shmid = shmget( IPC_PRIVATE, image->bytes_per_line * height, IPC_CREAT | 0700 );
++    if (shminfo->shmid == -1) { XDestroyImage( image ); return NULL; }
++
++    shminfo->shmaddr = shmat( shminfo->shmid, 0, 0 );
++    if (shminfo->shmaddr != (char *)-1)
++    {
++        BOOL ok;
++
++        shminfo->readOnly = False;  /* XShmGetImage has the server WRITE here, so NOT read-only */
++        X11DRV_expect_error( gdi_display, layered_overlay_shm_error, NULL );
++        ok = (XShmAttach( gdi_display, shminfo ) != 0);
++        XSync( gdi_display, False );
++        if (!X11DRV_check_error() && ok)
++        {
++            image->data = shminfo->shmaddr;
++            shmctl( shminfo->shmid, IPC_RMID, 0 );  /* segment is freed once detached */
++            return image;
++        }
++        shmdt( shminfo->shmaddr );
++    }
++    shmctl( shminfo->shmid, IPC_RMID, 0 );
++    shminfo->shmid = -1;
++    XDestroyImage( image );
++    return NULL;
++}
++
++static void layered_overlay_destroy_shm_image( XImage *image, XShmSegmentInfo *shminfo )
++{
++    if (!image) return;
++    if (shminfo->shmid != -1)
++    {
++        XShmDetach( gdi_display, shminfo );
++        shmdt( shminfo->shmaddr );
++        shminfo->shmid = -1;
++    }
++    image->data = NULL;  /* data is shared memory, not Xlib's to free */
++    XDestroyImage( image );
++}
++#endif /* HAVE_LIBXXSHM */
++
++/* Read the overlay client window's pixels. Prefers a persistent MIT-SHM image (the server
++   writes pixels straight into shared memory — no per-frame socket transfer of the whole
++   frame), recreated only when the window resizes, and falls back to XGetImage when SHM is
++   unavailable or momentarily fails. *is_shm marks the persistent image (caller must not free). */
++static XImage *layered_overlay_read_pixels( struct x11drv_client_surface *surface,
++                                            unsigned int width, unsigned int height, BOOL *is_shm )
++{
++    *is_shm = FALSE;
++#ifdef HAVE_LIBXXSHM
++    if (surface->shm_unavailable)
++    {
++        if (surface->shm_retry_count) surface->shm_retry_count--;
++        if (!surface->shm_retry_count) surface->shm_unavailable = FALSE;
++    }
++
++    if (!surface->shm_unavailable)
++    {
++        if (surface->shm_image && (surface->shm_w != width || surface->shm_h != height))
++        {
++            layered_overlay_destroy_shm_image( surface->shm_image, &surface->shm_info );
++            surface->shm_image = NULL;
++        }
++        if (!surface->shm_image)
++        {
++            XWindowAttributes attr;
++
++            if (XGetWindowAttributes( gdi_display, surface->window, &attr ))
++                surface->shm_image = layered_overlay_create_shm_image( attr.visual, attr.depth,
++                                                                       width, height, &surface->shm_info );
++            if (surface->shm_image)
++            {
++                surface->shm_w = width;
++                surface->shm_h = height;
++                surface->shm_retry_count = 0;
++            }
++            else
++            {
++                surface->shm_unavailable = TRUE;
++                surface->shm_retry_count = 60;
++            }
++        }
++        if (surface->shm_image)
++        {
++            BOOL ok;
++
++            X11DRV_expect_error( gdi_display, layered_overlay_shm_error, NULL );
++            ok = XShmGetImage( gdi_display, surface->window, surface->shm_image, 0, 0, AllPlanes );
++            if (!X11DRV_check_error() && ok) { *is_shm = TRUE; return surface->shm_image; }
++            layered_overlay_destroy_shm_image( surface->shm_image, &surface->shm_info );
++            surface->shm_image = NULL;
++            surface->shm_unavailable = TRUE;
++            surface->shm_retry_count = 60;
++            /* Avoid paying a failing SHM request every present; XGetImage handles this frame. */
++        }
++    }
++#endif
++    return XGetImage( gdi_display, surface->window, 0, 0, width, height, AllPlanes, ZPixmap );
++}
++
++static inline unsigned long layered_overlay_get_pixel_fast( const XImage *image, unsigned int x, unsigned int y )
++{
++    DWORD pixel;
++
++    memcpy( &pixel, image->data + y * image->bytes_per_line + x * 4, sizeof(pixel) );
++    return pixel;
++}
++
+ static void x11drv_client_surface_destroy( struct client_surface *client )
+ {
+     struct x11drv_client_surface *surface = impl_from_client_surface( client );
+@@ -338,6 +570,11 @@ static void x11drv_client_surface_destroy( struct client_surface *client )
      if (surface->window) destroy_client_window( hwnd, surface->window );
      if (surface->hdc_dst) NtGdiDeleteObjectApp( surface->hdc_dst );
      if (surface->hdc_src) NtGdiDeleteObjectApp( surface->hdc_src );
 +    free( surface->shape_age );
 +    free( surface->shape_rects );
++#ifdef HAVE_LIBXXSHM
++    if (surface->shm_image) layered_overlay_destroy_shm_image( surface->shm_image, &surface->shm_info );
++#endif
  }
  
  static void x11drv_client_surface_detach( struct client_surface *client )
-@@ -464,6 +511,132 @@ static void x11drv_client_surface_update( struct client_surface *client )
+@@ -464,6 +701,179 @@ static void x11drv_client_surface_update( struct client_surface *client )
      client_surface_update_offscreen( hwnd, surface );
  }
  
@@ -128,7 +317,7 @@ index 479ff421a3..c70235e0f2 100644
 +{
 +#ifdef HAVE_LIBXSHAPE
 +    unsigned int width, height, cols, rows, x, y, count = 0, capacity;
-+    BOOL actually_visible = FALSE;
++    BOOL actually_visible = FALSE, any_lum = FALSE, use_alpha = FALSE, fast_pixels = FALSE, image_is_shm = FALSE;
 +    XRectangle *rects;
 +    XImage *image;
 +    Window window;
@@ -137,8 +326,10 @@ index 479ff421a3..c70235e0f2 100644
 +       transparency. Input-shape changes don't repaint, so this adds click-through
 +       without bringing the reshape flicker back. */
 +    const int shape_kind = layered_overlay_alpha_enabled() ? ShapeInput : ShapeBounding;
++    const unsigned int hysteresis = layered_overlay_hysteresis();
 +
 +    if (!layered_overlay_shape_enabled() && !layered_overlay_alpha_enabled()) return TRUE;
++    if (!(NtUserGetWindowLongW( toplevel, GWL_EXSTYLE ) & WS_EX_LAYERED)) return TRUE;
 +
 +    width = surface->rect.right - surface->rect.left;
 +    height = surface->rect.bottom - surface->rect.top;
@@ -155,15 +346,43 @@ index 479ff421a3..c70235e0f2 100644
 +        free( surface->shape_rects );
 +        surface->shape_rects = NULL;
 +        surface->shape_rect_count = 0;
++#ifdef HAVE_LIBXXSHM
++        surface->shm_unavailable = FALSE;
++        surface->shm_retry_count = 0;
++#endif
 +    }
 +    if (!surface->shape_age) return TRUE;
 +
-+    if (!(image = XGetImage( gdi_display, surface->window, 0, 0, width, height, AllPlanes, ZPixmap ))) return TRUE;
++    /* ALPHA mode: throttle the readback/reshape. The readback only feeds the click-through
++       input shape here (the ARGB visual carries the visible alpha), so recomputing it every
++       present is wasted GPU->CPU bandwidth. shape_rects is NULL on the first frame and after
++       any resize (reset above), so those always refresh immediately and stay interactive.
++       SHAPE mode is never throttled: its readback gates the visible blit. */
++    if (layered_overlay_alpha_enabled() && !layered_overlay_shape_enabled() && surface->shape_rects)
++    {
++        unsigned int hz = layered_overlay_input_hz();
++        if (hz)
++        {
++            ULONGLONG now = layered_overlay_now_ms();
++            if (now - surface->shape_last_ms < 1000u / hz) return TRUE;
++            surface->shape_last_ms = now;
++        }
++    }
++
++    if (!(image = layered_overlay_read_pixels( surface, width, height, &image_is_shm ))) return TRUE;
++
++    /* ALPHA mode: build the click-through INPUT shape from the real per-pixel alpha (the
++       window is a 32-bit ARGB visual), not luminance, so opaque-but-dark pixels (e.g. a
++       sprite's black outline) stay clickable instead of becoming click-through holes. Falls
++       back to luminance if the read-back isn't 32-bit. SHAPE mode keeps the luminance test:
++       it builds the *visible* bounding shape and has no alpha channel to read. */
++    use_alpha = layered_overlay_alpha_enabled() && image->depth == 32;
++    fast_pixels = image->bits_per_pixel == 32 && image->byte_order == LSBFirst;
 +
 +    capacity = cols * rows;
 +    if (!(rects = malloc( capacity * sizeof(*rects) )))
 +    {
-+        XDestroyImage( image );
++        if (!image_is_shm) XDestroyImage( image );
 +        return TRUE;
 +    }
 +
@@ -179,11 +398,16 @@ index 479ff421a3..c70235e0f2 100644
 +
 +            for (yy = y; yy < min( y + 4, height ) && !visible; yy++)
 +                for (xx = x; xx < min( x + 4, width ); xx++)
-+                    if (XGetPixel( image, xx, yy ) & 0x00f0f0f0)
++                {
++                    unsigned long px = fast_pixels ? layered_overlay_get_pixel_fast( image, xx, yy )
++                                                   : XGetPixel( image, xx, yy );
++                    if (px & 0x00f0f0f0) any_lum = TRUE;     /* any non-black pixel (safety net) */
++                    if (use_alpha ? (((px >> 24) & 0xff) >= 16) : (px & 0x00f0f0f0))
 +                    {
 +                        visible = TRUE;
 +                        break;
 +                    }
++                }
 +
 +            /* Hysteresis: a block stays in the shape for several frames after it was
 +               last seen lit. This absorbs the transient all/partial-black frames that
@@ -192,7 +416,7 @@ index 479ff421a3..c70235e0f2 100644
 +               otherwise shrink the shape every active frame and flicker. Growth is
 +               instant (content shows immediately); only shrink is delayed, a brief
 +               and barely-visible trail. */
-+            if (visible) { *age = 12; actually_visible = TRUE; }
++            if (visible) { *age = hysteresis; actually_visible = TRUE; }
 +            else if (*age) --*age;
 +
 +            if (*age && run_start < 0) run_start = x;
@@ -210,7 +434,19 @@ index 479ff421a3..c70235e0f2 100644
 +        }
 +    }
 +
-+    XDestroyImage( image );
++    if (!image_is_shm) XDestroyImage( image );
++    if (layered_overlay_alpha_enabled() && !layered_overlay_shape_enabled())
++        surface->shape_last_ms = layered_overlay_now_ms();
++
++    /* ALPHA-mode safety net: if the ARGB read-back exposed no usable alpha anywhere (some
++       drivers don't return readable alpha) yet there is clearly visible content, don't apply
++       an empty input shape — that would make the whole overlay click-through and uninteractive.
++       Keep the previous input shape and just present this frame. */
++    if (use_alpha && !count && any_lum)
++    {
++        free( rects );
++        return TRUE;
++    }
 +
 +    /* Only call XShapeCombineRectangles when the shape actually changed. On the first call
 +       the window has the default full shape, so an all-black first frame (count==0) must be
@@ -250,7 +486,7 @@ index 479ff421a3..c70235e0f2 100644
  static void X11DRV_client_surface_present( struct client_surface *client, HDC hdc )
  {
      struct x11drv_client_surface *surface = impl_from_client_surface( client );
-@@ -494,8 +667,12 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
+@@ -494,8 +904,12 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
          TRACE( "Surface is present.\n" );
          region = get_dc_monitor_region( hwnd, hdc );
          if (region) NtGdiExtSelectClipRgn( hdc, region, RGN_COPY );
@@ -265,7 +501,7 @@ index 479ff421a3..c70235e0f2 100644
          if (region) NtGdiDeleteObjectApp( region );
          window_surface_release( win_surface );
          return;
-@@ -528,8 +705,9 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
+@@ -528,8 +942,9 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
          set_dc_drawable( surface->hdc_dst, window, &rect_dst, IncludeInferiors );
      if (region) NtGdiExtSelectClipRgn( surface->hdc_dst, region, RGN_COPY );
  
@@ -277,7 +513,7 @@ index 479ff421a3..c70235e0f2 100644
      XFlush( gdi_display );
  
  done:
-@@ -571,6 +749,22 @@ Window x11drv_client_surface_create( HWND hwnd, BOOL raw, int format, struct cli
+@@ -571,6 +986,22 @@ Window x11drv_client_surface_create( HWND hwnd, BOOL raw, int format, struct cli
  
      if (format && !visual_from_pixel_format( format, &visual )) return None;
  
@@ -301,7 +537,7 @@ index 479ff421a3..c70235e0f2 100644
      else colormap = XCreateColormap( gdi_display, get_dummy_parent(), visual.visual, visual_class_alloc( visual.class ) );
      if (!colormap) return None;
 diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
-index 63a8536c71..fa0aafe4d4 100644
+index cf014f3..feb74cb 100644
 --- a/dlls/winex11.drv/window.c
 +++ b/dlls/winex11.drv/window.c
 @@ -431,7 +431,6 @@ static struct x11drv_win_data *alloc_win_data( Display *display, HWND hwnd )
@@ -356,7 +592,7 @@ index 63a8536c71..fa0aafe4d4 100644
      {
          /* For transparent windows, set an empty input shape to allow mouse pass-through */
          static XRectangle empty_rect;
-@@ -2763,6 +2765,17 @@ static void create_whole_window( struct x11drv_win_data *data )
+@@ -2786,6 +2788,17 @@ static void create_whole_window( struct x11drv_win_data *data )
      }
      data->shaped = (win_rgn != 0);
  
@@ -374,7 +610,7 @@ index 63a8536c71..fa0aafe4d4 100644
      if (data->vis.visualid != default_visual.visualid)
          data->whole_colormap = XCreateColormap( data->display, root_window, data->vis.visual, AllocNone );
  
-@@ -2946,7 +2959,12 @@ void X11DRV_SetWindowStyle( HWND hwnd, INT offset, STYLESTRUCT *style )
+@@ -2969,7 +2982,12 @@ void X11DRV_SetWindowStyle( HWND hwnd, INT offset, STYLESTRUCT *style )
          if (changed & WS_EX_LAYERED) /* changing WS_EX_LAYERED resets attributes */
          {
              data->layered = FALSE;
@@ -388,7 +624,7 @@ index 63a8536c71..fa0aafe4d4 100644
              sync_window_opacity( data->display, data->whole_window, 0, 0 );
          }
          if (changed & WS_EX_TRANSPARENT) sync_window_style( data );
-@@ -3663,7 +3681,7 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+@@ -3687,7 +3705,7 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
  
      /* layered windows are mapped only once their attributes are set */
      if (data->pending_state.wm_state == WithdrawnState && (new_style & WS_VISIBLE) &&
@@ -397,7 +633,7 @@ index 63a8536c71..fa0aafe4d4 100644
      {
          WARN( "win %p/%lx is layered, delaying mapping\n", hwnd, data->whole_window );
          new_style &= ~WS_VISIBLE;
-@@ -4162,6 +4180,7 @@ void net_supporting_wm_check_init( struct x11drv_thread_data *data )
+@@ -4186,6 +4204,7 @@ void net_supporting_wm_check_init( struct x11drv_thread_data *data )
          char const *sgi = getenv( "SteamGameId" );
  
          if (!strcmp( data->window_manager, "GNOME Shell" )) strcpy( data->window_manager, "Mutter" );
@@ -405,3 +641,16 @@ index 63a8536c71..fa0aafe4d4 100644
          TRACE( "Detected window manager: %s\n", debugstr_a(data->window_manager) );
  
          /* Street Fighter V expects a certain sequence of window resizes
+diff --git a/dlls/winex11.drv/x11drv.h b/dlls/winex11.drv/x11drv.h
+index 41fc515..ff4410d 100644
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -367,6 +367,8 @@ struct x11drv_escape_get_drawable
+ };
+
+ extern BOOL needs_offscreen_rendering( HWND hwnd );
++extern BOOL layered_overlay_shape_enabled(void);
++extern BOOL layered_overlay_alpha_enabled(void);
+ extern void set_dc_drawable( HDC hdc, Drawable drawable, const RECT *rect, int mode );
+ extern Drawable get_dc_drawable( HDC hdc, RECT *rect );
+ extern HRGN get_dc_monitor_region( HWND hwnd, HDC hdc );
