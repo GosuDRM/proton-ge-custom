@@ -6,6 +6,7 @@ compositor blends the swapchain's per-pixel alpha. Off by default. Pairs with th
 ARGB-visual change. Enables real transparency (zero flicker) for DWM-glass overlay games.
 Ported for DXVK 1.10.3, where the presenter still lives under src/vulkan.
 Also add explicit <cstdint> includes needed by current MinGW/GCC toolchains.
+Skip DXVK's old ID3D10StateBlock UUID fallback when current MinGW headers already provide it.
 
 diff --git a/src/vulkan/vulkan_presenter.cpp b/src/vulkan/vulkan_presenter.cpp
 index b02869e..f261482 100644
@@ -56,3 +57,17 @@ index 4936f87..430ff64 100644
 +#include <cstdint>
  #include <string>
  #include <unordered_map>
+diff --git a/src/d3d10/d3d10_interfaces.h b/src/d3d10/d3d10_interfaces.h
+index 8484be2..f74d5c2 100644
+--- a/src/d3d10/d3d10_interfaces.h
++++ b/src/d3d10/d3d10_interfaces.h
+@@ -3,7 +3,8 @@
+ #include "d3d10_include.h"
+-
++#ifndef __ID3D10StateBlock_INTERFACE_DEFINED__
+ #ifdef _MSC_VER
+ struct __declspec(uuid("0803425a-57f5-4dd6-9465-a87570834a08")) ID3D10StateBlock;
+ #else
+ __CRT_UUID_DECL(ID3D10StateBlock, 0x0803425a,0x57f5,0x4dd6,0x94,0x65,0xa8,0x75,0x70,0x83,0x4a,0x08);
+ #endif
++#endif
