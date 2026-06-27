@@ -5,6 +5,7 @@ When WINE_LAYERED_OVERLAY_ALPHA is set, request a non-opaque Vulkan compositeAlp
 compositor blends the swapchain's per-pixel alpha. Off by default. Pairs with the winex11
 ARGB-visual change. Enables real transparency (zero flicker) for DWM-glass overlay games.
 Ported for DXVK 1.10.3, where the presenter still lives under src/vulkan.
+Also add an explicit <cstdint> include needed by current MinGW/GCC toolchains.
 
 diff --git a/src/vulkan/vulkan_presenter.cpp b/src/vulkan/vulkan_presenter.cpp
 index b02869e..f261482 100644
@@ -37,3 +38,13 @@ index b02869e..f261482 100644
      swapInfo.presentMode            = m_info.presentMode;
      swapInfo.clipped                = VK_TRUE;
      swapInfo.oldSwapchain           = VK_NULL_HANDLE;
+diff --git a/src/util/util_bit.h b/src/util/util_bit.h
+index 9839615..7f14e61 100644
+--- a/src/util/util_bit.h
++++ b/src/util/util_bit.h
+@@ -20,3 +20,4 @@
+-#include <cstring>
++#include <cstdint>
++#include <cstring>
+ #include <iterator>
+ #include <type_traits>
