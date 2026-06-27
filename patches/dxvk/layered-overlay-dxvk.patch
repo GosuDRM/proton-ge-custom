@@ -4,12 +4,14 @@ When WINE_LAYERED_OVERLAY_ALPHA is set, request a non-opaque Vulkan compositeAlp
 (premultiplied/straight, falling back to INHERIT which is what X11 surfaces expose) so the
 compositor blends the swapchain's per-pixel alpha. Off by default. Pairs with the winex11
 ARGB-visual change. Enables real transparency (zero flicker) for DWM-glass overlay games.
-diff --git a/src/dxvk/dxvk_presenter.cpp b/src/dxvk/dxvk_presenter.cpp
-index f0d2651..51141c4 100644
---- a/src/dxvk/dxvk_presenter.cpp
-+++ b/src/dxvk/dxvk_presenter.cpp
-@@ -735,6 +735,26 @@ namespace dxvk {
-     swapInfo.imageSharingMode       = VK_SHARING_MODE_EXCLUSIVE;
+Ported for DXVK 1.10.3, where the presenter still lives under src/vulkan.
+
+diff --git a/src/vulkan/vulkan_presenter.cpp b/src/vulkan/vulkan_presenter.cpp
+index b02869e..f261482 100644
+--- a/src/vulkan/vulkan_presenter.cpp
++++ b/src/vulkan/vulkan_presenter.cpp
+@@ -166,6 +166,26 @@ namespace dxvk::vk {
+     swapInfo.pQueueFamilyIndices    = nullptr;
      swapInfo.preTransform           = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
      swapInfo.compositeAlpha         = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
 +
@@ -17,7 +19,7 @@ index f0d2651..51141c4 100644
 +    // so transparent regions show the desktop instead of an opaque black box. The value
 +    // selects the blend mode for testing without a rebuild: 1 = premultiplied, 2 = straight.
 +    if (std::string overlayAlpha = env::getEnvVar("WINE_LAYERED_OVERLAY_ALPHA"); !overlayAlpha.empty() && overlayAlpha != "0") {
-+      VkCompositeAlphaFlagsKHR supported = caps.surfaceCapabilities.supportedCompositeAlpha;
++      VkCompositeAlphaFlagsKHR supported = caps.supportedCompositeAlpha;
 +      VkCompositeAlphaFlagBitsKHR want = (overlayAlpha == "2")
 +        ? VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR : VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
 +      VkCompositeAlphaFlagBitsKHR alt = (overlayAlpha == "2")
@@ -32,6 +34,6 @@ index f0d2651..51141c4 100644
 +        " (surface supports ", uint32_t(supported), ")"));
 +    }
 +
-     swapInfo.presentMode            = m_presentMode;
+     swapInfo.presentMode            = m_info.presentMode;
      swapInfo.clipped                = VK_TRUE;
- 
+     swapInfo.oldSwapchain           = VK_NULL_HANDLE;
